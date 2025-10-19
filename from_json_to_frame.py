@@ -52,8 +52,9 @@ def apply_transform(im: Image.Image, name: str) -> Image.Image:
         return ImageOps.mirror(im).transpose(Image.ROTATE_90)
 
     if t == "MIRROR_ROTATE_180":
-        # Отражение по вертикали (эквивалентно зеркалу + повороту на 180°)
-        return ImageOps.flip(im)
+        # В игре этот флаг используется для пистолета: фактически нужен поворот на 90° CCW
+        # без дополнительного ресемплинга, иначе появляются "смазанные" пиксели.
+        return im.transpose(Image.ROTATE_90)
 
     if t == "MIRROR_ROTATE_270":
         return ImageOps.mirror(im).transpose(Image.ROTATE_270)
