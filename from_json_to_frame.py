@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+from typing import Dict, Tuple, Optional
 from PIL import Image, ImageOps
 
 # --------------- НАСТРОЙКИ ---------------
@@ -25,10 +26,51 @@ def sha256_java_argb(img: Image.Image) -> str:
 
 # --------------- ТРАНСФОРМ ---------------
 
-def apply_transform(im: Image.Image, name: str) -> Image.Image:
+_TransformKey = Tuple[str, str]
+
+
+# Спрайт пистолета в JSON помечен как MIRROR_ROTATE_180, но визуально
+# требуется поворот на 90° CCW. Чтобы не ломать остальные детали, можно
+# переопределить трансформацию по идентификатору (или хэшу) спрайта.
+TRANSFORM_OVERRIDES: Dict[_TransformKey, Dict[str, str]] = {
+    ("sprite_id", "344"): {"MIRROR_ROTATE_180": "ROTATE_90"},
+    ("sprite_id", "345"): {"MIRROR_ROTATE_180": "ROTATE_90"},
+    ("sprite_id", "393"): {"MIRROR_ROTATE_180": "ROTATE_90"},
+}
+
+
+def _normalize_transform(
+    name: str,
+    sprite_id: Optional[int],
+    sprite_hash: Optional[str],
+) -> str:
+    """Возвращает финальное название трансформации с учётом оверрайдов."""
+
+    norm = (name or "NONE").upper()
+
+    if sprite_id is not None:
+        override = TRANSFORM_OVERRIDES.get(("sprite_id", str(sprite_id)))
+        if override and norm in override:
+            return override[norm]
+
+    if sprite_hash:
+        override = TRANSFORM_OVERRIDES.get(("sprite_hash", sprite_hash.lower()))
+        if override and norm in override:
+            return override[norm]
+
+    return norm
+
+
+def apply_transform(
+    im: Image.Image,
+    name: str,
+    *,
+    sprite_id: Optional[int] = None,
+    sprite_hash: Optional[str] = None,
+) -> Image.Image:
     """Применяет трансформацию спрайта в соответствии с флагами из JSON."""
 
-    t = (name or "NONE").upper()
+    t = _normalize_transform(name, sprite_id, sprite_hash)
 
     if t in {"NONE", "DEFAULT"}:
         return im
@@ -52,9 +94,9 @@ def apply_transform(im: Image.Image, name: str) -> Image.Image:
         return ImageOps.mirror(im).transpose(Image.ROTATE_90)
 
     if t == "MIRROR_ROTATE_180":
-        # В игре этот флаг используется для пистолета: фактически нужен поворот на 90° CCW
-        # без дополнительного ресемплинга, иначе появляются "смазанные" пиксели.
-        return im.transpose(Image.ROTATE_90)
+        # По данным формата это горизонтальное отражение + поворот на 180°,
+        # что эквивалентно вертикальному флипу без ресемплинга.
+        return ImageOps.flip(im)
 
     if t == "MIRROR_ROTATE_270":
         return ImageOps.mirror(im).transpose(Image.ROTATE_270)
@@ -116,7 +158,12 @@ def build_frame(frame_key: str) -> Image.Image:
 
         # 2) применяем трансформацию
         transform_name = (part.get("transform", {}).get("name") or "NONE")
-        transformed_crop = apply_transform(crop, transform_name)
+        transformed_crop = apply_transform(
+            crop,
+            transform_name,
+            sprite_id=part.get("sprite_id"),
+            sprite_hash=sprite_hash,
+        )
         final_crop = transformed_crop
 
         # 3) позиция: absolute_position
