@@ -1,7 +1,7 @@
 import os
 import json
 import hashlib
-from PIL import Image
+from PIL import Image, ImageOps
 
 # --------------- НАСТРОЙКИ ---------------
 JSON_PATH = "capture_0001.json"
@@ -25,80 +25,38 @@ def sha256_java_argb(img: Image.Image) -> str:
 
 # --------------- ТРАНСФОРМ ---------------
 
-from PIL import Image
-
-
 def apply_transform(im: Image.Image, name: str) -> Image.Image:
-    """
-    Универсальная функция трансформаций с финальным исправлением
-    для случая 'MIRROR_ROTATE_180'.
-    """
+    """Применяет трансформацию спрайта в соответствии с флагами из JSON."""
+
     t = (name or "NONE").upper()
 
-    # --- Простые трансформации, не меняющие размеры ---
-    if t == "NONE":
+    if t in {"NONE", "DEFAULT"}:
         return im
-    if t in ("FLIP_H", "MIRROR"):
-        return im.transpose(Image.FLIP_LEFT_RIGHT)
+
+    if t in {"FLIP_H", "MIRROR"}:
+        return ImageOps.mirror(im)
+
     if t == "FLIP_V":
-        return im.transpose(Image.FLIP_TOP_BOTTOM)
+        return ImageOps.flip(im)
+
+    if t == "ROTATE_90":
+        return im.transpose(Image.ROTATE_90)
+
     if t == "ROTATE_180":
         return im.transpose(Image.ROTATE_180)
 
-    # --- НАШ СЛУЧАЙ: Неверно названная трансформация ---
-    # Судя по вашему тесту, эта операция на самом деле является поворотом на 90 градусов.
-    # Применяем безопасный поворот через паддинг, чтобы избежать обрезки и искажения.
+    if t == "ROTATE_270":
+        return im.transpose(Image.ROTATE_270)
+
+    if t == "MIRROR_ROTATE_90":
+        return ImageOps.mirror(im).transpose(Image.ROTATE_90)
+
     if t == "MIRROR_ROTATE_180":
-        w, h = im.size
+        # Отражение по вертикали (эквивалентно зеркалу + повороту на 180°)
+        return ImageOps.flip(im)
 
-        # Создаем временный холст, чтобы избежать обрезки
-        padding = 2
-        side = max(w, h) + padding * 2
-        square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-        offset_x = (side - w) // 2
-        offset_y = (side - h) // 2
-        square.paste(im, (offset_x, offset_y), im)
-
-        # Применяем поворот на 90 градусов (CCW), который дал правильную ориентацию
-        rotated_square = square.transpose(Image.ROTATE_90)
-
-        # Вырезаем центральную часть, но уже с инвертированными размерами (h x w)
-        crop_x = (side - h) // 2
-        crop_y = (side - w) // 2
-
-        # Возвращаем повернутое изображение без искажений
-        return rotated_square.crop((crop_x, crop_y, crop_x + h, crop_y + w))
-
-    # --- Другие трансформации, которые могут менять размеры ---
-    # (Оставим общую логику для них на всякий случай)
-    if t in ("ROTATE_90", "ROTATE_270", "MIRROR_ROTATE_90", "MIRROR_ROTATE_270"):
-        # Здесь можно будет использовать ту же логику с паддингом,
-        # если эти трансформации тоже будут вызывать проблемы.
-        # Пока что можно оставить как есть или использовать код из предыдущего ответа.
-        # Для чистоты, применим тот же безопасный метод:
-
-        # Определяем, какую операцию Pillow нужно вызвать
-        op = None
-        if t == "ROTATE_90":
-            op = Image.ROTATE_270  # В Pillow они инвертированы
-        elif t == "ROTATE_270":
-            op = Image.ROTATE_90
-
-        if op:
-            # Создаем временный холст
-            w, h = im.size
-            padding = 2
-            side = max(w, h) + padding * 2
-            square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-            offset_x = (side - w) // 2
-            offset_y = (side - h) // 2
-            square.paste(im, (offset_x, offset_y), im)
-
-            rotated_square = square.transpose(op)
-
-            crop_x = (side - h) // 2
-            crop_y = (side - w) // 2
-            return rotated_square.crop((crop_x, crop_y, crop_x + h, crop_y + w))
+    if t == "MIRROR_ROTATE_270":
+        return ImageOps.mirror(im).transpose(Image.ROTATE_270)
 
     return im
 
@@ -157,20 +115,14 @@ def build_frame(frame_key: str) -> Image.Image:
 
         # 2) применяем трансформацию
         transform_name = (part.get("transform", {}).get("name") or "NONE")
-        transformed_crop = apply_transform(crop, transform_name, 0, 0)  # Размеры не важны
+        transformed_crop = apply_transform(crop, transform_name)
+        final_crop = transformed_crop
 
-        # 3) подгоняем под итоговый размер (после трансформации)
-        dst_w, dst_h = part["size"]["width"], part["size"]["height"]
-        if transformed_crop.size != (dst_w, dst_h):
-            final_crop = transformed_crop.resize((dst_w, dst_h), Image.NEAREST)
-        else:
-            final_crop = transformed_crop
-
-        # 4) позиция: absolute_position
+        # 3) позиция: absolute_position
         pos_x = int(round(part["absolute_position"]["x"] - fb["x"]))
         pos_y = int(round(part["absolute_position"]["y"] - fb["y"]))
 
-        # 5) накладываем с альфой
+        # 4) накладываем с альфой
         canvas.paste(final_crop, (pos_x, pos_y), final_crop)
 
     return canvas
