@@ -108,9 +108,61 @@ def apply_transform(
 
 
 
-# --------------- ЗАГРУЗКА JSON ---------------
-with open(JSON_PATH, "r", encoding="utf-8") as f:
-    data = json.load(f)
+# --------------- ЧТЕНИЕ JSON ---------------
+_WHITESPACE = {" ", "\t", "\r", "\n"}
+
+
+def _strip_trailing_commas(payload: str) -> str:
+    """Удаляет завершающие запятые перед } или ] вне строк."""
+
+    result: list[str] = []
+    in_string = False
+    escape = False
+
+    for ch in payload:
+        if in_string:
+            result.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            continue
+
+        if ch in "]}":
+            idx = len(result) - 1
+            while idx >= 0 and result[idx] in _WHITESPACE:
+                idx -= 1
+            if idx >= 0 and result[idx] == ',':
+                del result[idx]
+            result.append(ch)
+            continue
+
+        result.append(ch)
+
+    return "".join(result)
+
+
+def load_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as fh:
+        payload = fh.read()
+
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        cleaned = _strip_trailing_commas(payload)
+        if cleaned != payload:
+            return json.loads(cleaned)
+        raise
+
+
+data = load_json(JSON_PATH)
 
 frame_keys = data["meta"]["frame_keys"]
 frames = data["frames"]
