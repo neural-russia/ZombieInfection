@@ -1,7 +1,7 @@
 import os
 import json
 import hashlib
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 from PIL import Image, ImageOps
 
 # --------------- НАСТРОЙКИ ---------------
@@ -10,7 +10,6 @@ SPRITES_DIR = "sprites"
 OUTPUT_DIR = "frames"
 GIF_PATH = "capture_0001.gif"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --------------- ХЭШ ARGB (совместим с твоим Java) ---------------
 def sha256_java_argb(img: Image.Image) -> str:
@@ -24,10 +23,9 @@ def sha256_java_argb(img: Image.Image) -> str:
         raw = bytes(buf)
     return hashlib.sha256(raw).hexdigest()
 
+
 # --------------- ТРАНСФОРМ ---------------
-
 _TransformKey = Tuple[str, str]
-
 
 # Спрайт пистолета в JSON помечен как MIRROR_ROTATE_180, но визуально
 # требуется поворот на 90° CCW. Чтобы не ломать остальные детали, можно
@@ -104,10 +102,6 @@ def apply_transform(
     return im
 
 
-
-
-
-
 # --------------- ЧТЕНИЕ JSON ---------------
 _WHITESPACE = {" ", "\t", "\r", "\n"}
 
@@ -162,28 +156,30 @@ def load_json(path: str) -> dict:
         raise
 
 
-data = load_json(JSON_PATH)
-
-frame_keys = data["meta"]["frame_keys"]
-frames = data["frames"]
-
 # --------------- ИНДЕКС ПО ХЭШУ ---------------
-print("📦 Индексируем изображения...")
-hash_to_path = {}
-for fname in os.listdir(SPRITES_DIR):
-    if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-        continue
-    path = os.path.join(SPRITES_DIR, fname)
-    try:
-        with Image.open(path) as im:
-            digest = sha256_java_argb(im)
-            hash_to_path[digest] = path
-    except Exception as e:
-        print(f"⚠️ Не удалось прочитать {fname}: {e}")
-print(f"✅ Индексировано {len(hash_to_path)} изображений.")
+def index_sprites(directory: str) -> Dict[str, str]:
+    print("📦 Индексируем изображения...")
+    hash_to_path: Dict[str, str] = {}
+    for fname in os.listdir(directory):
+        if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            continue
+        path = os.path.join(directory, fname)
+        try:
+            with Image.open(path) as im:
+                digest = sha256_java_argb(im)
+                hash_to_path[digest] = path
+        except Exception as e:
+            print(f"⚠️ Не удалось прочитать {fname}: {e}")
+    print(f"✅ Индексировано {len(hash_to_path)} изображений.")
+    return hash_to_path
+
 
 # --------------- СБОРКА ОДНОГО КАДРА ---------------
-def build_frame(frame_key: str) -> Image.Image:
+def build_frame(
+    frame_key: str,
+    frames: Dict[str, dict],
+    hash_to_path: Dict[str, str],
+) -> Image.Image:
     frame = frames[frame_key]
     fb = frame["bounds"]
     parts = frame["parts"]
@@ -202,11 +198,14 @@ def build_frame(frame_key: str) -> Image.Image:
             print(f"⏭️ {frame_key}: нет файла для hash={sprite_hash[:8]}… — пропуск")
             continue
 
-        sprite = Image.open(sprite_path).convert("RGBA")
+        with Image.open(sprite_path) as sprite_img:
+            sprite = sprite_img.convert("RGBA")
 
         # 1) crop из source в координатах исходного спрайта
         src = part["source"]
-        crop = sprite.crop((src["x"], src["y"], src["x"] + src["width"], src["y"] + src["height"]))
+        crop = sprite.crop(
+            (src["x"], src["y"], src["x"] + src["width"], src["y"] + src["height"])
+        )
 
         # 2) применяем трансформацию
         transform_name = (part.get("transform", {}).get("name") or "NONE")
@@ -227,32 +226,68 @@ def build_frame(frame_key: str) -> Image.Image:
 
     return canvas
 
-# --------------- СБОРКА ВСЕХ КАДРОВ ---------------
-assembled = []
-durations = []
-for key in frame_keys:
-    print(f"🧩 Собираем {key} …")
-    img = build_frame(key)
-    img.save(os.path.join(OUTPUT_DIR, f"{key}.png"))
-    assembled.append(img)
-    durations.append(frames[key].get("duration_ms", 40))  # fallback 40ms
 
-print(f"✅ Собрано кадров: {len(assembled)}")
+def trim_to_content(image: Image.Image) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
+    """Обрезает прозрачные поля, возвращает срез и bbox (x0, y0, x1, y1)."""
 
-# --------------- ЭКСПОРТ GIF ---------------
-if assembled:
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    if bbox is None:
+        full_bbox = (0, 0, image.width, image.height)
+        return image, full_bbox
+
+    cropped = image.crop(bbox)
+    return cropped, bbox
+
+
+def export_gif(frames: List[Image.Image], durations: List[int], path: str) -> None:
     print("🎞️ Экспорт GIF …")
-    first, *rest = assembled
-    # transparency/disposal для лучшей прозрачности и перерисовки
+    first, *rest = frames
     first.save(
-        GIF_PATH,
+        path,
         save_all=True,
         append_images=rest,
         duration=durations,
         loop=0,
-        disposal=2,      # restore to background
-        transparency=0,  # индекс прозрачности; Pillow сам подставит, но оставим параметр
+        disposal=2,
+        transparency=0,
     )
-    print(f"🎬 GIF сохранён: {GIF_PATH}")
-else:
-    print("❌ Нет кадров для экспорта.")
+    print(f"🎬 GIF сохранён: {path}")
+
+
+def main() -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    data = load_json(JSON_PATH)
+
+    frame_keys = data["meta"]["frame_keys"]
+    frames = data["frames"]
+
+    hash_to_path = index_sprites(SPRITES_DIR)
+
+    assembled: List[Image.Image] = []
+    durations: List[int] = []
+
+    for key in frame_keys:
+        print(f"🧩 Собираем {key} …")
+        img = build_frame(key, frames, hash_to_path)
+
+        trimmed, _bbox = trim_to_content(img)
+        trimmed.save(os.path.join(OUTPUT_DIR, f"{key}.png"))
+
+        assembled.append(img)
+        durations.append(frames[key].get("duration_ms", 40))
+
+    print(f"✅ Собрано кадров: {len(assembled)}")
+
+    if assembled:
+        export_gif(assembled, durations, GIF_PATH)
+    else:
+        print("❌ Нет кадров для экспорта.")
+
+
+if __name__ == "__main__":
+    main()
