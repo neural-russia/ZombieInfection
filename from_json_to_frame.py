@@ -1,7 +1,9 @@
 import os
 import json
 import hashlib
-from typing import Dict, Tuple, Optional, List
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, List, Callable, Iterable
+
 from PIL import Image, ImageOps
 
 # --------------- НАСТРОЙКИ ---------------
@@ -30,29 +32,105 @@ _TransformKey = Tuple[str, str]
 # Спрайт пистолета в JSON помечен как MIRROR_ROTATE_180, но визуально
 # требуется поворот на 90° CCW. Чтобы не ломать остальные детали, можно
 # переопределить трансформацию по идентификатору (или хэшу) спрайта.
-TRANSFORM_OVERRIDES: Dict[_TransformKey, Dict[str, str]] = {
+DEFAULT_TRANSFORM_OVERRIDES: Dict[_TransformKey, Dict[str, str]] = {
     ("sprite_id", "344"): {"MIRROR_ROTATE_180": "ROTATE_90"},
     ("sprite_id", "345"): {"MIRROR_ROTATE_180": "ROTATE_90"},
     ("sprite_id", "393"): {"MIRROR_ROTATE_180": "ROTATE_90"},
 }
+
+# Для совместимости с прежними импортами
+TRANSFORM_OVERRIDES = DEFAULT_TRANSFORM_OVERRIDES
+
+
+def merge_transform_overrides(
+    *overrides_dicts: Iterable[Tuple[_TransformKey, Dict[str, str]]]
+) -> Dict[_TransformKey, Dict[str, str]]:
+    """Объединяет несколько словарей оверрайдов в один."""
+
+    merged: Dict[_TransformKey, Dict[str, str]] = {}
+    for overrides in overrides_dicts:
+        if overrides is None:
+            continue
+        if isinstance(overrides, dict):
+            items = overrides.items()
+        else:
+            items = overrides
+        for key, mapping in items:
+            if not isinstance(mapping, dict):
+                mapping = dict(mapping)
+            bucket = merged.setdefault(key, {})
+            bucket.update(mapping)
+    return merged
+
+
+def load_transform_overrides(path: str) -> Dict[_TransformKey, Dict[str, str]]:
+    """Загружает оверрайды трансформаций из JSON-файла."""
+
+    with open(path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+
+    if not isinstance(payload, list):
+        raise ValueError("Файл оверрайдов должен содержать список объектов")
+
+    result: Dict[_TransformKey, Dict[str, str]] = {}
+    for idx, entry in enumerate(payload):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Элемент №{idx + 1} в файле оверрайдов должен быть объектом")
+
+        target_key: Optional[_TransformKey] = None
+        if "sprite_id" in entry:
+            target_key = ("sprite_id", str(entry["sprite_id"]))
+        elif "sprite_hash" in entry:
+            target_key = ("sprite_hash", str(entry["sprite_hash"]).lower())
+
+        if not target_key:
+            raise ValueError(
+                "Каждый оверрайд должен содержать ключ 'sprite_id' или 'sprite_hash'"
+            )
+
+        mapping = {
+            k.upper(): str(v).upper()
+            for k, v in entry.items()
+            if k not in {"sprite_id", "sprite_hash"}
+        }
+        if not mapping:
+            raise ValueError(
+                f"В оверрайде для {target_key} не найдено ни одной замены трансформации"
+            )
+
+        result.setdefault(target_key, {}).update(mapping)
+
+    return result
+
+
+def _resolve_overrides(
+    extra_overrides: Optional[Dict[_TransformKey, Dict[str, str]]]
+) -> Dict[_TransformKey, Dict[str, str]]:
+    if extra_overrides:
+        return merge_transform_overrides(DEFAULT_TRANSFORM_OVERRIDES, extra_overrides)
+    return dict(DEFAULT_TRANSFORM_OVERRIDES)
 
 
 def _normalize_transform(
     name: str,
     sprite_id: Optional[int],
     sprite_hash: Optional[str],
+    overrides: Optional[Dict[_TransformKey, Dict[str, str]]] = None,
 ) -> str:
     """Возвращает финальное название трансформации с учётом оверрайдов."""
 
     norm = (name or "NONE").upper()
 
+    if overrides is None:
+        overrides = DEFAULT_TRANSFORM_OVERRIDES
+
     if sprite_id is not None:
-        override = TRANSFORM_OVERRIDES.get(("sprite_id", str(sprite_id)))
+        override = overrides.get(("sprite_id", str(sprite_id)))
         if override and norm in override:
             return override[norm]
 
     if sprite_hash:
-        override = TRANSFORM_OVERRIDES.get(("sprite_hash", sprite_hash.lower()))
+        override = overrides.get(("sprite_hash", sprite_hash.lower()))
         if override and norm in override:
             return override[norm]
 
@@ -65,10 +143,11 @@ def apply_transform(
     *,
     sprite_id: Optional[int] = None,
     sprite_hash: Optional[str] = None,
+    overrides: Optional[Dict[_TransformKey, Dict[str, str]]] = None,
 ) -> Image.Image:
     """Применяет трансформацию спрайта в соответствии с флагами из JSON."""
 
-    t = _normalize_transform(name, sprite_id, sprite_hash)
+    t = _normalize_transform(name, sprite_id, sprite_hash, overrides)
 
     if t in {"NONE", "DEFAULT"}:
         return im
@@ -179,6 +258,8 @@ def build_frame(
     frame_key: str,
     frames: Dict[str, dict],
     hash_to_path: Dict[str, str],
+    *,
+    transform_overrides: Optional[Dict[_TransformKey, Dict[str, str]]] = None,
 ) -> Image.Image:
     frame = frames[frame_key]
     fb = frame["bounds"]
@@ -214,6 +295,7 @@ def build_frame(
             transform_name,
             sprite_id=part.get("sprite_id"),
             sprite_hash=sprite_hash,
+            overrides=transform_overrides,
         )
         final_crop = transformed_crop
 
@@ -258,35 +340,80 @@ def export_gif(frames: List[Image.Image], durations: List[int], path: str) -> No
     print(f"🎬 GIF сохранён: {path}")
 
 
-def main() -> None:
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+@dataclass
+class FrameData:
+    key: str
+    image: Image.Image
+    trimmed: Image.Image
+    bbox: Tuple[int, int, int, int]
+    duration_ms: int
 
-    data = load_json(JSON_PATH)
+
+def assemble_frames(
+    json_path: str,
+    sprites_dir: str,
+    *,
+    transform_overrides: Optional[Dict[_TransformKey, Dict[str, str]]] = None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+) -> List[FrameData]:
+    data = load_json(json_path)
 
     frame_keys = data["meta"]["frame_keys"]
     frames = data["frames"]
 
-    hash_to_path = index_sprites(SPRITES_DIR)
+    effective_overrides = _resolve_overrides(transform_overrides)
+    hash_to_path = index_sprites(sprites_dir)
 
-    assembled: List[Image.Image] = []
-    durations: List[int] = []
+    assembled: List[FrameData] = []
 
-    for key in frame_keys:
+    total = len(frame_keys)
+    for idx, key in enumerate(frame_keys):
         print(f"🧩 Собираем {key} …")
-        img = build_frame(key, frames, hash_to_path)
+        img = build_frame(key, frames, hash_to_path, transform_overrides=effective_overrides)
 
-        trimmed, _bbox = trim_to_content(img)
-        trimmed.save(os.path.join(OUTPUT_DIR, f"{key}.png"))
+        trimmed, bbox = trim_to_content(img)
+        duration = frames[key].get("duration_ms", 40)
+        assembled.append(
+            FrameData(
+                key=key,
+                image=img,
+                trimmed=trimmed,
+                bbox=bbox,
+                duration_ms=duration,
+            )
+        )
 
-        assembled.append(img)
-        durations.append(frames[key].get("duration_ms", 40))
+        if progress:
+            progress(idx + 1, total, key)
 
     print(f"✅ Собрано кадров: {len(assembled)}")
+    if progress:
+        progress(total, total, "")
+    return assembled
 
-    if assembled:
-        export_gif(assembled, durations, GIF_PATH)
-    else:
+
+def save_trimmed_frames(frames: List[FrameData], directory: str) -> None:
+    os.makedirs(directory, exist_ok=True)
+    for frame in frames:
+        frame_path = os.path.join(directory, f"{frame.key}.png")
+        frame.trimmed.save(frame_path)
+    print(f"💾 Кадры сохранены в {directory}")
+
+
+def main() -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    frames = assemble_frames(JSON_PATH, SPRITES_DIR)
+    if not frames:
         print("❌ Нет кадров для экспорта.")
+        return
+
+    save_trimmed_frames(frames, OUTPUT_DIR)
+    export_gif(
+        [frame.image for frame in frames],
+        [frame.duration_ms for frame in frames],
+        GIF_PATH,
+    )
 
 
 if __name__ == "__main__":
